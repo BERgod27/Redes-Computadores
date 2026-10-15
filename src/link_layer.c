@@ -52,6 +52,9 @@ static LinkLayer parameters;
 // Number (0 or 1) of the next I frame to send (Tx) or to receive (Rx)
 static int frameNumber = 0;
 
+// Set by llReceive when the Transmitter's DISC arrives (llCloseRx must not wait for it again)
+static int discReceived = 0;
+
 // Statistics printed by llClose
 static int framesCount = 0;    // I frames sent (Tx) or received (Rx), without repetitions
 static int timeoutCount = 0;   // timeouts while waiting for RR (Tx)
@@ -110,7 +113,7 @@ static int waitFrame(const unsigned char *expected)
 }
 
 // Reads bytes from the serial port and, using a state machine, waits for any
-// frame with A = 0x03 and a correct BCC1 (I frame, SET, RR or REJ).
+// frame with A = 0x03 and a correct BCC1 (I frame, SET, DISC, RR or REJ).
 // The bytes between BCC1 and the final FLAG (data and BCC2 of an I frame) are
 // saved without byte stuffing in `data` (MAX_PAYLOAD_SIZE + 1 bytes) and their number in `size`.
 // Returns the C field of the frame, or -1 if the alarm fired first.
@@ -176,6 +179,19 @@ static int readFrame(unsigned char *data, int *size)
     return state == STOP ? c : -1;
 }
 
+// Receiver: waits for the next frame from the Transmitter (see readFrame).
+// Gives up when no frame arrives for nRetransmissions * timeout seconds: by then
+// the Transmitter has used all its retransmissions of the frame and given up.
+// Returns the C field of the frame, or -1 on timeout.
+static int readFrameRx(unsigned char *data, int *size)
+{
+    alarmEnabled = 1;
+    alarm(parameters.nRetransmissions * parameters.timeout);
+    int c = readFrame(data, size);
+    alarm(0); // disable any pending alarm
+    return c;
+}
+
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -233,7 +249,7 @@ int llOpenRx(LinkLayer llParameters)
     // Save the parameters for llCloseRx
     parameters = llParameters;
 
-    // Install the alarm handler (used by llCloseRx)
+    // Install the alarm handler (used by llReceive and llCloseRx)
     struct sigaction sa = {0};
     sa.sa_handler = alarmHandler; // no SA_RESTART: the alarm interrupts a blocked read
     if (sigaction(SIGALRM, &sa, NULL) == -1)
@@ -352,10 +368,22 @@ int llReceive(unsigned char *packet)
 
     while (1)
     {
-        // Wait for a frame (no alarm: waits indefinitely)
-        alarmEnabled = 1;
-        int c = readFrame(data, &size);
+        // Wait for a frame, until the Transmitter has been silent for too long
+        int c = readFrameRx(data, &size);
 
+        if (c < 0)
+        {
+            printf("No frames received for %d s. Connection lost.\n",
+                   parameters.nRetransmissions * parameters.timeout);
+            return -1;
+        }
+        if (c == DISC_TX_FRAME[2])
+        {
+            // The Transmitter gave up and is closing the connection: llCloseRx replies to it
+            printf("DISC received before the end of the data.\n");
+            discReceived = 1;
+            return -1;
+        }
         if (c == SET_FRAME[2])
         {
             // The Transmitter did not get our UA: reply with UA again
@@ -439,15 +467,34 @@ int llCloseTx()
 
 int llCloseRx()
 {
-    // Wait for DISC (no alarm: waits indefinitely)
-    printf("Waiting for DISC...\n");
-    alarmEnabled = 1;
-    waitFrame(DISC_TX_FRAME);
-    printf("DISC received.\n");
+    // Wait for DISC (unless llReceive already received it), until the Transmitter has been silent for too long
+    if (!discReceived)
+        printf("Waiting for DISC...\n");
+    unsigned char data[MAX_PAYLOAD_SIZE + 1];
+    int size;
+    while (!discReceived)
+    {
+        int c = readFrameRx(data, &size);
+        if (c < 0)
+            break;
+        if (c == DISC_TX_FRAME[2])
+            discReceived = 1;
+        else if ((c == 0x00 && frameNumber == 1) || (c == 0x80 && frameNumber == 0))
+        {
+            // Repeated I frame (the RR of the last frame was lost): send the RR again
+            writeBytesSerialPort(RR_FRAME[frameNumber], 5);
+            printf("Repeated I%d received. RR%d sent.\n", 1 - frameNumber, frameNumber);
+            duplicateCount++;
+        }
+        // Any other frame (a new I frame is not accepted after the end of the data): ignore it
+    }
+
+    if (discReceived)
+        printf("DISC received.\n");
 
     // Reply with DISC and retransmit it on timeout, up to nRetransmissions attempts
     int r = -1;
-    for (int attempt = 1; attempt <= parameters.nRetransmissions && r < 0; attempt++)
+    for (int attempt = 1; discReceived && attempt <= parameters.nRetransmissions && r < 0; attempt++)
     {
         // Send DISC
         int bytes = writeBytesSerialPort(DISC_RX_FRAME, 5);
@@ -462,8 +509,10 @@ int llCloseRx()
 
     if (r == 0)
         printf("UA received. Connection closed.\n");
-    else
+    else if (discReceived)
         printf("No UA received.\n");
+    else
+        printf("No DISC received.\n");
 
     printf("Statistics: %d I frames received, %d repeated, %d REJ sent\n",
            framesCount, duplicateCount, rejCount);
