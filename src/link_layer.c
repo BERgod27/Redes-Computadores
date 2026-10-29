@@ -75,8 +75,6 @@ static int waitFrame(const unsigned char *expected)
         if (readByteSerialPort(&byte) <= 0)
             continue;
 
-        printf("byte = 0x%02X\n", byte); // debug
-
         switch (state)
         {
         case START:
@@ -115,7 +113,8 @@ static int waitFrame(const unsigned char *expected)
 // Reads bytes from the serial port and, using a state machine, waits for any
 // frame with A = 0x03 and a correct BCC1 (I frame, SET, DISC, RR or REJ).
 // The bytes between BCC1 and the final FLAG (data and BCC2 of an I frame) are
-// saved without byte stuffing in `data` (MAX_PAYLOAD_SIZE + 1 bytes) and their number in `size`.
+// saved without byte stuffing in `data` (MAX_PAYLOAD_SIZE + 1 bytes) and their number in `size`
+// (more than MAX_PAYLOAD_SIZE + 1 if the frame was too long: then only the first bytes are saved).
 // Returns the C field of the frame, or -1 if the alarm fired first.
 static int readFrame(unsigned char *data, int *size)
 {
@@ -163,11 +162,14 @@ static int readFrame(unsigned char *data, int *size)
         case BCC_OK:
             // BCC1 is correct, reading the data (if any) until the final FLAG
             if (byte == FLAG) state = STOP;
-            else if (n > MAX_PAYLOAD_SIZE) state = START; // too long (a FLAG was lost): discard the frame
             else if (byte == ESC) escape = 1;
             else
             {
-                data[n++] = escape ? byte ^ 0x20 : byte;
+                // A frame too long for `data` (an ESC was corrupted or a FLAG was lost) is still read until
+                // its final FLAG, so that it can be rejected: its extra bytes are counted but not saved
+                if (n <= MAX_PAYLOAD_SIZE)
+                    data[n] = escape ? byte ^ 0x20 : byte;
+                n++;
                 escape = 0;
             }
             break;
@@ -404,12 +406,15 @@ int llReceive(unsigned char *packet)
             continue;
         }
 
+        // A frame too long for `data` has errors (see readFrame)
+        int tooLong = size > MAX_PAYLOAD_SIZE + 1;
+
         // BCC2 is the last byte: it must be equal to the XOR of the data bytes
         unsigned char bcc2 = 0;
-        for (int i = 0; i < size - 1; i++)
+        for (int i = 0; !tooLong && i < size - 1; i++)
             bcc2 ^= data[i];
 
-        if (size == 0 || bcc2 != data[size - 1])
+        if (size == 0 || tooLong || bcc2 != data[size - 1])
         {
             // Errors in the data: ask the Transmitter to send the frame again
             writeBytesSerialPort(REJ_FRAME[number], 5);
